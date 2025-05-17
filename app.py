@@ -23,6 +23,7 @@ import time
 import ipaddress
 from user_agents import parse
 import kaleido # For exporting plotly charts to static images
+import db_utils 
 
 # --- MAPBOX Configuration ---
 MAPBOX_ACCESS_TOKEN = "YOUR_MAPBOX_ACCESS_TOKEN"
@@ -39,7 +40,7 @@ LOG_REGEX = re.compile(
 )
 
 # --- IP Geolocation Cache ---
-ip_geocache = {}
+# ip_geocache = {}
 
 # --- Helper Functions ---
 def parse_log_line(line):
@@ -124,19 +125,49 @@ def is_public_ip(ip_str):
     except ValueError:
         return False
 
-def geolocate_ip(ip_address):
-    if not is_public_ip(ip_address):
-        return {"ip": ip_address, "status": "private_or_reserved", "lat": None, "lon": None, "country": "N/A", "city": "N/A"}
-    if ip_address in ip_geocache:
-        return ip_geocache[ip_address]
+# def geolocate_ip(ip_address):
+#     if not is_public_ip(ip_address):
+#         return {"ip": ip_address, "status": "private_or_reserved", "lat": None, "lon": None, "country": "N/A", "city": "N/A"}
+#     if ip_address in ip_geocache:
+#         return ip_geocache[ip_address]
     
-    geo_data = {"ip": ip_address, "status": "error", "lat": None, "lon": None, "country": "Error", "city": "Error"}
+#     geo_data = {"ip": ip_address, "status": "error", "lat": None, "lon": None, "country": "Error", "city": "Error"}
+#     try:
+#         response = requests.get(f"http://ip-api.com/json/{ip_address}?fields=status,message,country,city,lat,lon,query", timeout=3)
+#         response.raise_for_status() 
+#         data = response.json()
+#         if data.get("status") == "success":
+#             geo_data = {
+#                 "ip": data.get("query"), 
+#                 "status": "success",
+#                 "lat": data.get("lat"),
+#                 "lon": data.get("lon"),
+#                 "country": data.get("country", "N/A"),
+#                 "city": data.get("city", "N/A")
+#             }
+#     except Exception:
+#         # Keep geo_data as error state if API fails
+#         pass 
+#     ip_geocache[ip_address] = geo_data
+#     time.sleep(1.4) # Be slightly more aggressive: ~42 req/min
+#     return geo_data
+
+def call_ip_api(ip_address): # Renamed from geolocate_ip
+    """Calls the external IP API. Does NOT interact with DB directly."""
+    if not is_public_ip(ip_address):
+        logger.debug(f"API_CALL: {ip_address} is private/reserved. Not calling external API.")
+        return {"ip": ip_address, "status": "private_or_reserved"}
+
+    logger.debug(f"API_CALL: Calling external API for {ip_address}")
+    api_response_data = {"ip": ip_address, "status": "failed_unknown", "message": "Initial error state"}
     try:
-        response = requests.get(f"http://ip-api.com/json/{ip_address}?fields=status,message,country,city,lat,lon,query", timeout=3)
-        response.raise_for_status() 
+        # ip-api.com: free for non-commercial use, 45 reqs/min from same IP.
+        response = requests.get(f"http://ip-api.com/json/{ip_address}?fields=status,message,country,city,lat,lon,query", timeout=4) # Slightly longer timeout
+        response.raise_for_status()
         data = response.json()
+        
         if data.get("status") == "success":
-            geo_data = {
+            api_response_data = {
                 "ip": data.get("query"), 
                 "status": "success",
                 "lat": data.get("lat"),
@@ -144,12 +175,25 @@ def geolocate_ip(ip_address):
                 "country": data.get("country", "N/A"),
                 "city": data.get("city", "N/A")
             }
-    except Exception:
-        # Keep geo_data as error state if API fails
-        pass 
-    ip_geocache[ip_address] = geo_data
-    time.sleep(1.4) # Be slightly more aggressive: ~42 req/min
-    return geo_data
+        else: # API call succeeded but returned a 'fail' status (e.g., 'private range', 'reserved range', 'invalid query')
+            api_response_data["status"] = data.get("status", "failed_api_error") # More specific status
+            api_response_data["message"] = data.get("message", "API returned fail status.")
+            # If ip-api says it's private/reserved, trust it
+            if data.get("message") and ("private range" in data.get("message") or "reserved range" in data.get("message")):
+                 api_response_data["status"] = "private_or_reserved"
+
+
+    except requests.exceptions.Timeout:
+        logger.warning(f"API_CALL: Timeout for {ip_address}")
+        api_response_data["status"] = "failed_timeout"
+        api_response_data["message"] = "API request timed out"
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API_CALL: RequestException for {ip_address}: {e}")
+        api_response_data["status"] = "failed_request_exception"
+        api_response_data["message"] = str(e)
+    
+    # time.sleep is handled by the worker
+    return api_response_data
 
 # --- Anomaly Detection Functions ---
 def detect_error_bursts(df, time_window_minutes=1, threshold_factor=2.0, min_errors=3):
@@ -219,6 +263,20 @@ app.layout = dbc.Container(fluid=True, children=[
     dcc.Store(id='full-error-bursts-store'), 
     dcc.Store(id='full-high-traffic-ips-store'),
 
+    dcc.Interval(
+        id='geolocation-worker-interval',
+        interval=15 * 1000,  # Every 15 seconds (4 calls per 15s = 16 calls/min, well within 45/min)
+        n_intervals=0
+    ),
+    html.Div(id='geolocation-worker-status', style={'display': 'none'}), # Hidden div for output
+
+    # (in app.layout, near other dcc.Store or dcc.Interval components)
+    dcc.Interval(
+        id='map-refresh-interval',
+        interval=3 * 60 * 1000,  # 3 minutes in milliseconds
+        n_intervals=0
+    ),
+    
     # ... (Header, Upload, Filters, Summary Cards - largely same layout as before)
     dbc.Row(dbc.Col(html.H1("NGINX Log Anomaly Dashboard", className="text-center my-4"))),
     dbc.Row([dbc.Col([ dcc.Upload(id='upload-log-file', children=html.Div(['Drag and Drop or ', html.A('Select NGINX Log File')]), style={'width': '100%', 'height': '60px', 'lineHeight': '60px', 'borderWidth': '1px', 'borderStyle': 'dashed', 'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px 0'}, multiple=False), 
@@ -358,6 +416,98 @@ def generate_response_size_dist_chart(df):
 
 
 # --- Callbacks ---
+# (in app.py, callbacks section)
+# Rate limiting for the worker
+# Keep track of the last 45 API call timestamps
+API_CALL_TIMESTAMPS = [] 
+MAX_CALLS_PER_MINUTE = 40 # Be conservative
+MINUTE_IN_SECONDS = 60
+
+@app.callback(
+    Output('geolocation-worker-status', 'children'),
+    [Input('geolocation-worker-interval', 'n_intervals')],
+    [State('log-data-store', 'data'), # To find new IPs to queue
+     State('full-high-traffic-ips-store', 'data'), # Prioritize anomalous IPs
+     State('full-error-bursts-store', 'data')]     # Prioritize anomalous IPs
+)
+def geolocation_worker_tick(n_intervals, all_log_data_json, high_traffic_ips, error_bursts_anomalies):
+    global API_CALL_TIMESTAMPS
+    logger.info(f"Geolocation worker tick #{n_intervals}")
+
+    # 1. Add new IPs from logs to the queue if not already present
+    if all_log_data_json:
+        df_all_logs = pd.DataFrame(all_log_data_json)
+        if not df_all_logs.empty and 'ip_address' in df_all_logs.columns:
+            unique_ips_in_logs = df_all_logs['ip_address'].unique()
+            logger.debug(f"Worker: Found {len(unique_ips_in_logs)} unique IPs in current log data.")
+            # Prioritize IPs from anomalies
+            priority_ips = set()
+            if high_traffic_ips:
+                for item in high_traffic_ips:
+                    priority_ips.add(item.get('ip_address'))
+            if error_bursts_anomalies: # Error bursts might contain multiple IPs or none directly
+                # Assuming error_bursts_anomalies structure. You might need to parse IPs from them if they are not direct.
+                # For now, let's assume this step is for future enhancement or that IPs are easily extractable
+                pass # Placeholder for extracting IPs from error bursts if needed
+
+            # Add priority IPs first
+            for ip_addr in priority_ips:
+                if is_public_ip(ip_addr): # Only queue public IPs
+                    db_utils.add_ip_to_geolocate_queue(ip_addr)
+            
+            # Then add other IPs, perhaps in smaller batches to avoid long DB lock
+            ips_to_check_in_db = [ip for ip in unique_ips_in_logs if ip not in priority_ips and is_public_ip(ip)]
+            for ip_addr in ips_to_check_in_db[:100]: # Process in chunks
+                 db_utils.add_ip_to_geolocate_queue(ip_addr)
+
+
+    # 2. Get IPs to process from DB (pending or failed-retry)
+    # How many IPs can we process in this tick?
+    # Remove timestamps older than a minute
+    now = time.time()
+    API_CALL_TIMESTAMPS = [ts for ts in API_CALL_TIMESTAMPS if now - ts < MINUTE_IN_SECONDS]
+    
+    calls_allowed_this_tick = MAX_CALLS_PER_MINUTE - len(API_CALL_TIMESTAMPS)
+    # Distribute calls over the interval. If interval is 15s, 45/min = ~11 calls per 15s.
+    # We set MAX_CALLS_PER_MINUTE to 40, so 40/4 = 10 calls per 15s interval.
+    # Let's process a smaller batch per tick, e.g., 2-3, to spread it out.
+    process_limit_this_tick = min(max(0, calls_allowed_this_tick), 3) # Process up to 3 IPs this tick
+    
+    if process_limit_this_tick == 0:
+        logger.info("Worker: Rate limit reached for this minute. Skipping API calls in this tick.")
+        return f"Rate limit potentially active. Processed 0 IPs."
+
+    ips_to_process = db_utils.get_ips_to_process_from_db(limit=process_limit_this_tick)
+    
+    processed_count = 0
+    if not ips_to_process:
+        logger.info("Worker: No IPs currently in 'pending' or 'retry' state in DB.")
+        return f"No IPs in queue. Processed 0 IPs."
+
+    for ip_addr in ips_to_process:
+        logger.info(f"Worker: Processing IP {ip_addr}...")
+        # Check rate limit again before each call (more robust)
+        now = time.time()
+        API_CALL_TIMESTAMPS = [ts for ts in API_CALL_TIMESTAMPS if now - ts < MINUTE_IN_SECONDS]
+        if len(API_CALL_TIMESTAMPS) >= MAX_CALLS_PER_MINUTE:
+            logger.warning(f"Worker: Hit rate limit before processing {ip_addr}. Will retry later.")
+            break # Stop processing for this tick
+
+        api_result = call_ip_api(ip_addr) # This is the actual API call
+        API_CALL_TIMESTAMPS.append(time.time()) # Record call time
+        
+        db_utils.update_geolocation_in_db(ip_addr, api_result)
+        processed_count += 1
+        
+        # Small delay between calls even if under rate limit, to be extremely nice
+        if len(ips_to_process) > 1 and processed_count < len(ips_to_process) : 
+            time.sleep(1.6) # (60 seconds / 40 calls = 1.5s per call)
+                            # Add a bit more to be safe
+
+    logger.info(f"Worker: Finished tick. Processed {processed_count} IPs.")
+    return f"Processed {processed_count} IPs in this tick."
+
+
 @app.callback(
     [Output('log-data-store', 'data'), Output('upload-status', 'children'),
      Output('date-picker-range', 'min_date_allowed'), Output('date-picker-range', 'max_date_allowed'),
@@ -643,48 +793,141 @@ def update_htip_page_store(active_page):
 
 @app.callback(
     Output('ip-location-map-chart', 'figure'),
-    [Input('filtered-log-data-store', 'data')]
+    [Input('filtered-log-data-store', 'data'),
+     Input('map-refresh-interval', 'n_intervals')], # Refresh map when worker runs
+    [State('full-high-traffic-ips-store', 'data'), # To identify anomalous IPs
+     State('full-error-bursts-store', 'data')]     # To identify anomalous IPs
 )
-def update_ip_map(filtered_log_data_json):
+def update_ip_map(filtered_log_data_json, geo_worker_tick, high_traffic_ips_anomalies, error_bursts_anomalies_data):
+    # The 'geo_worker_tick' argument is removed as it's no longer an Input here
+    triggered_id = ctx.triggered_id
+    logger.info(f"Updating IP geolocation map. Triggered by: {triggered_id}")
     # ... (update_ip_map logic from previous version, using go.Scattermap) ...
     empty_map_fig = go.Figure(data=[go.Scattermap(lat=[], lon=[])])
     empty_map_fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0}, map_style="open-street-map", map_center={"lat":0,"lon":0},map_zoom=1, annotations=[{"text":"No IP data / geolocation failed.","align":"center","showarrow":False,"xref":"paper","yref":"paper","x":0.5,"y":0.5}])
     if not filtered_log_data_json: return empty_map_fig
     df_filtered = pd.DataFrame(filtered_log_data_json)
     if df_filtered.empty: return empty_map_fig
-    unique_ips_in_filtered_view = df_filtered['ip_address'].unique()
-    geo_locations_data = []
-    if len(unique_ips_in_filtered_view) > 0:
-        ips_to_process_for_map = unique_ips_in_filtered_view[:20] # Limit for performance
-        for ip_addr in ips_to_process_for_map:
-            loc_data = geolocate_ip(ip_addr)
-            if loc_data and loc_data.get("status") == "success" and loc_data.get("lat") is not None: 
-                geo_locations_data.append(loc_data)
-        if geo_locations_data:
-            geo_df = pd.DataFrame(geo_locations_data)
-            ip_counts = df_filtered['ip_address'].value_counts().reset_index()
-            ip_counts.columns=['ip','request_count']
-            geo_df = pd.merge(geo_df, ip_counts, on='ip', how='left').fillna({'request_count':1})
-            geo_df['marker_size'] = np.log1p(geo_df['request_count']) * 5 + 5 # Scale marker size
-            
-            fig_ip_map = go.Figure(data=[go.Scattermap(
-                lat=geo_df['lat'], lon=geo_df['lon'], mode='markers', 
-                marker=dict(size=geo_df['marker_size'],color="#007bff",opacity=0.7), 
-                text=geo_df.apply(lambda r: f"IP: {r['ip']}<br>City: {r.get('city','N/A')}<br>Country: {r.get('country','N/A')}<br>Requests: {int(r['request_count'])}", axis=1), 
-                hoverinfo='text'
-            )])
-            map_center_lat = geo_df['lat'].mean() if not geo_df.empty else 0
-            map_center_lon = geo_df['lon'].mean() if not geo_df.empty else 0
-            map_zoom = 1.5 if not geo_df.empty else 1
+    unique_ips_in_view = df_filtered['ip_address'].unique()
+    
+    # Identify anomalous IPs from the stores
+    anomalous_ip_set = set()
+    if high_traffic_ips_anomalies:
+        for item in high_traffic_ips_anomalies:
+            anomalous_ip_set.add(item.get('ip_address'))
+    # You might need a more robust way to get IPs from error_bursts if they aren't directly listed
+    # For now, assuming error_bursts_anomalies_data is a list of dicts with 'ip_address' or similar.
+    # This part needs refinement based on actual structure of error_bursts_anomalies_data
+    # if error_bursts_anomalies_data:
+    #     for burst in error_bursts_anomalies_data:
+    #         # Example: if burst details contain IPs
+    #         # if 'involved_ips' in burst: anomalous_ip_set.update(burst['involved_ips'])
+    #         pass
+    
+    geo_locations_for_map = []
+    geolocated_count = 0
+    public_ips_in_view = 0
 
-            fig_ip_map.update_layout(
-                map_style="open-street-map", 
-                map_center={"lat": map_center_lat, "lon": map_center_lon}, 
-                map_zoom=map_zoom, 
-                margin={"r":0,"t":0,"l":0,"b":0}
-            )
-            return fig_ip_map
-    return empty_map_fig
+    for ip_addr in unique_ips_in_view:
+        if not is_public_ip(ip_addr):
+            continue
+        public_ips_in_view +=1
+        
+        geo_data = db_utils.get_geolocated_ip_from_db(ip_addr)
+        if geo_data and geo_data.get("status") == "success" and geo_data.get("lat") is not None:
+            geo_data['is_anomalous'] = ip_addr in anomalous_ip_set # Mark if anomalous
+            geo_locations_for_map.append(geo_data)
+            geolocated_count +=1
+        elif not geo_data: # Not even in DB, means it wasn't picked up by worker yet
+            db_utils.add_ip_to_geolocate_queue(ip_addr) # Add it for next worker cycle
+
+    if not geo_locations_for_map:
+        progress_text = f"0/{public_ips_in_view} public IPs geolocated. Waiting for worker..." if public_ips_in_view > 0 else "No public IPs in view."
+        empty_map_fig.update_layout(annotations=[{"text":progress_text,"align":"center","showarrow":False,"xref":"paper","yref":"paper","x":0.5,"y":0.5}])
+        return empty_map_fig
+
+    geo_df = pd.DataFrame(geo_locations_for_map)
+    
+    # Add request counts for sizing
+    ip_counts_in_filtered = df_filtered['ip_address'].value_counts().reset_index()
+    ip_counts_in_filtered.columns = ['ip', 'request_count']
+    geo_df = pd.merge(geo_df, ip_counts_in_filtered, on='ip', how='left').fillna({'request_count': 1})
+    geo_df['marker_size'] = np.log1p(geo_df['request_count']) * 5 + 8 # Adjusted sizing
+
+    # Assign colors: one for normal, one for anomalous
+    # Ensure the 'color' column contains valid color strings or hex codes
+    geo_df['color_val'] = geo_df['is_anomalous'].apply(lambda x: 'red' if x else '#007bff')
+    geo_df['symbol_val'] = geo_df['is_anomalous'].apply(lambda x: 'circle' if x else 'circle') # 'star' or 'marker' for pin
+
+    fig_ip_map = go.Figure()
+
+    # Plot normal IPs
+    normal_df = geo_df[~geo_df['is_anomalous']]
+    if not normal_df.empty:
+        fig_ip_map.add_trace(go.Scattermap(
+            lat=normal_df['lat'], 
+            lon=normal_df['lon'], 
+            mode='markers',
+            marker=dict(
+                size=normal_df['marker_size'], 
+                color=normal_df['color_val'], # Use the specific color column
+                opacity=0.7,
+                # symbol=normal_df['symbol_val'] # Symbol can be problematic with color arrays
+                                                # Let's try without explicit symbol for normal ones first,
+                                                # or ensure it's a single symbol type like 'circle' if color array is used
+                symbol='circle' # Explicitly set to circle for this trace
+            ),
+            text=normal_df.apply(lambda r: f"IP: {r['ip']}<br>City: {r.get('city','N/A')}<br>Country: {r.get('country','N/A')}<br>Requests: {int(r['request_count'])}", axis=1),
+            hoverinfo='text', 
+            name='Normal IP' # This name will appear in the legend
+        ))
+
+    # Plot anomalous IPs
+    anomalous_df = geo_df[geo_df['is_anomalous']]
+    if not anomalous_df.empty:
+        fig_ip_map.add_trace(go.Scattermap(
+            lat=anomalous_df['lat'], 
+            lon=anomalous_df['lon'], 
+            mode='markers',
+            marker=dict(
+                size=anomalous_df['marker_size'], # * 1.5, # Make anomalous markers larger
+                color=anomalous_df['color_val'],    # Use the specific color column
+                opacity=0.9,
+                # color='red', # Explicitly set color for anomalous IPs
+                symbol='circle'  # Try 'star', or 'marker' (a pin) if star is too pixelated
+                                # You could also use a different simple shape like 'square'
+            ),
+            text=anomalous_df.apply(lambda r: f"<b>ANOMALOUS IP: {r['ip']}</b><br>City: {r.get('city','N/A')}<br>Country: {r.get('country','N/A')}<br>Requests: {int(r['request_count'])}", axis=1),
+            hoverinfo='text', 
+            name='Anomalous IP' # This name will appear in the legend
+        ))
+    
+    map_center_lat = geo_df['lat'].mean() if not geo_df.empty else 0
+    map_center_lon = geo_df['lon'].mean() if not geo_df.empty else 0
+    map_zoom = 1.5 if not geo_df.empty else 1
+    
+    progress_percentage = (geolocated_count / public_ips_in_view * 100) if public_ips_in_view > 0 else 0
+    map_title = f"IP Locations ({geolocated_count}/{public_ips_in_view} public IPs geolocated - {progress_percentage:.0f}%)"
+
+    fig_ip_map.update_layout(
+            title_text=map_title, title_x=0.5,
+            map_style="open-street-map",
+            map_center={"lat": map_center_lat, "lon": map_center_lon},
+            map_zoom=map_zoom,
+            margin={"r":0,"t":35,"l":0,"b":0},
+            legend=dict(
+                yanchor="top", y=0.99, 
+                xanchor="left", x=0.01,
+                bgcolor="rgba(255,255,255,0.7)", # Make legend background slightly transparent
+                bordercolor="Black",
+                borderwidth=1
+            ),
+            # It's possible that go.Scattermap legend items don't fully reflect individual marker symbols
+            # when symbols are varied within a trace based on data.
+            # The primary distinction in legend will be by trace name and its representative color.
+        )
+    return fig_ip_map
+
 
 
 @app.callback(
