@@ -1,12 +1,11 @@
 import dash
 import dash_bootstrap_components as dbc
-from dash import dcc, html, dash_table, Input, Output, State, callback, Patch
+from dash import dcc, html, dash_table, Input, Output, State
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
 import re
 from datetime import datetime, timedelta
-import io
 import base64
 from collections import Counter
 
@@ -394,6 +393,7 @@ def update_dashboard_elements(filtered_log_data_json, original_log_data_json):
     # Top Paths
     top_paths_data = df_filtered['path'].value_counts().nlargest(top_n).reset_index()
     top_paths_data.columns = ['path', 'count']
+    top_paths_data['path'] = top_paths_data['path'].str.slice(0,30)
     fig_top_paths = px.bar(top_paths_data, x='path', y='count', title=f'Top {top_n} Requested Paths')
     fig_top_paths.update_layout(template='plotly_white')
     
